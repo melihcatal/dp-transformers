@@ -1,25 +1,26 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import pandas as pd
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+
 import datasets
-from datasets import Dataset
+import opacus
+import pandas as pd
 import torch
+from accelerate.optimizer import AcceleratedOptimizer
+from datasets import Dataset
+from dp_transformers import arguments, sampler
+from opacus.accountants import RDPAccountant
+from opacus.utils.module_utils import clone_module
+from prv_accountant import Accountant as PRVAccountant
 from torch import nn
 from torch.utils.data import DataLoader
-from transformers import (
-    Trainer, TrainerCallback, TrainerState, TrainerControl, logging,
-    DataCollatorForLanguageModeling, PreTrainedTokenizer, training_args, modeling_utils
-)
-from transformers.file_utils import is_sagemaker_mp_enabled, is_datasets_available
-import opacus
-from opacus.accountants import RDPAccountant
-from prv_accountant import Accountant as PRVAccountant
-from contextlib import contextmanager
-from typing import Any, Callable, List, Optional, Union, Dict, Sequence
-from accelerate.optimizer import AcceleratedOptimizer
-
-from dp_transformers import sampler, arguments
+from transformers import (DataCollatorForLanguageModeling, PreTrainedTokenizer,
+                          Trainer, TrainerCallback, TrainerControl,
+                          TrainerState, logging, modeling_utils, training_args)
+from transformers.file_utils import (is_datasets_available,
+                                     is_sagemaker_mp_enabled)
 
 logger = logging.get_logger(__name__)
 
@@ -223,7 +224,7 @@ class OpacusDPTrainer(Trainer):
 
         return self.optimizer
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], *args) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
 
@@ -299,3 +300,18 @@ class OpacusDPTrainer(Trainer):
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
+        
+    def _unwrap_model(self, model):
+        if isinstance(model, GradSampleModule):
+            return model._module  # Access the original model
+        return model
+    
+    def _save(self, output_dir: Optional[str] = None, state_dict = None):
+        model2save = clone_module(self.model)
+        # make sure model2save is different from self.model
+        if model2save == self.model:
+            raise ValueError("model2save is the same as self.model")
+        model2save = self._unwrap_model(model2save)
+        state_dict = model2save.state_dict()
+        super()._save(output_dir, state_dict=state_dict)
+        
