@@ -301,17 +301,12 @@ class OpacusDPTrainer(Trainer):
             pin_memory=self.args.dataloader_pin_memory,
         )
         
-    def _unwrap_model(self, model):
-        if isinstance(model, GradSampleModule):
-            return model._module  # Access the original model
-        return model
     
     def _save(self, output_dir: Optional[str] = None, state_dict = None):
-        model2save = clone_module(self.model)
-        # make sure model2save is different from self.model
-        if model2save == self.model:
-            raise ValueError("model2save is the same as self.model")
-        model2save = self._unwrap_model(model2save)
-        state_dict = model2save.state_dict()
+        if state_dict is None:
+            if isinstance(self.model, GradSampleModule):
+                state_dict = self.model._module.state_dict()
+            else:
+                state_dict = self.model.state_dict()
         super()._save(output_dir, state_dict=state_dict)
         
