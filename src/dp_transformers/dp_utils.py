@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import os
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
@@ -13,6 +14,7 @@ from datasets import Dataset
 from dp_transformers import arguments, sampler
 from opacus.accountants import RDPAccountant
 from opacus.utils.module_utils import clone_module
+from peft import PeftModel
 from prv_accountant import Accountant as PRVAccountant
 from torch import nn
 from torch.utils.data import DataLoader
@@ -21,6 +23,9 @@ from transformers import (DataCollatorForLanguageModeling, PreTrainedTokenizer,
                           TrainerState, logging, modeling_utils, training_args)
 from transformers.file_utils import (is_datasets_available,
                                      is_sagemaker_mp_enabled)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
+from transformers.utils.import_utils import is_peft_available
 
 logger = logging.get_logger(__name__)
 
@@ -302,11 +307,43 @@ class OpacusDPTrainer(Trainer):
         )
         
     
-    def _save(self, output_dir: Optional[str] = None, state_dict = None):
-        if state_dict is None:
-            if isinstance(self.model, GradSampleModule):
-                state_dict = self.model._module.state_dict()
+    
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # If we are executing this function, we are the process zero, so we don't check for that.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Saving model checkpoint to {output_dir}")
+
+        supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
+        model2save = self.model._module if isinstance(self.model, GradSampleModule) else self.model
+        TRAINING_ARGS_NAME = "training_args.bin"
+
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        if not isinstance(model2save, supported_classes):
+            if state_dict is None:
+                state_dict = model2save.state_dict()
+
+            if isinstance(self.accelerator.unwrap_model(model2save), supported_classes):
+                self.accelerator.unwrap_model(model2save).save_pretrained(
+                    output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
+                )
             else:
-                state_dict = self.model.state_dict()
-        super()._save(output_dir, state_dict=state_dict)
-        
+    
+                logger.info("Trainer.model is not a `PreTrainedModel`, only saving its state dict.")
+                if self.args.save_safetensors:
+                    safetensors.torch.save_file(
+                        state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"}
+                    )
+                else:
+                    torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
+        else:
+            model2save.save_pretrained(
+                output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
+            )
+
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
